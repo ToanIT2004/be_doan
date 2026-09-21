@@ -154,32 +154,31 @@ Khoảng giữa hai ngưỡng là **reject option**. Đây là lựa chọn quan
 
 ## 7. Dữ liệu hiện tại
 
-Dữ liệu đã chuẩn hóa nằm trong:
+Dữ liệu mới nằm trong:
 
 ```text
-data/antispoof_raw/
-  train/{live,spoof}/subject_<id>/...
-  val/{live,spoof}/subject_<id>/...
-  test/{live,spoof}/subject_<id>/...
-
-data/antispoof/
-  train/{live,spoof}/*.jpg
-  val/{live,spoof}/*.jpg
-  test/{live,spoof}/*.jpg
+data/
+  train/<subject_id>/{live,spoof}/*.jpg
+  validate/<subject_id>/{live,spoof}/*.jpg
+  test/<subject_id>/{live,spoof}/*.jpg
 ```
 
 Thống kê crop dùng cho train:
 
 | Split | Live | Spoof | Tổng |
 | --- | ---: | ---: | ---: |
-| Train | 174 | 467 | 641 |
-| Validation | 56 | 202 | 258 |
-| Test | 76 | 169 | 245 |
-| Tổng | 306 | 838 | 1.144 |
+| Train | 2.254 | 2.254 | 4.508 |
+| Validation | 602 | 602 | 1.204 |
+| Test | 522 | 522 | 1.044 |
+| Tổng | 3.378 | 3.378 | 6.756 |
 
-Dữ liệu nguồn gồm 18 subject: 10 train, 4 validation và 4 test. Subject được tách rời giữa các split. Đây là nguyên tắc bắt buộc: các frame của cùng một người/video không được xuất hiện ở cả train và test, nếu không kết quả sẽ bị data leakage và cao giả tạo.
+Dữ liệu cân bằng theo lớp nên sampler cân bằng không làm thay đổi tỷ lệ hiện tại.
+Tên của cả 25 thư mục trong validation và test cũng xuất hiện trong train. Nếu
+các tên này thật sự là subject ID, phải chia lại theo subject trước khi dùng kết
+quả đánh giá; nếu không sẽ có data leakage và chỉ số cao giả tạo.
 
-Do lớp spoof nhiều hơn live, training dùng `WeightedRandomSampler` để hai lớp có cơ hội được lấy mẫu cân bằng trong mỗi epoch.
+Training vẫn dùng `WeightedRandomSampler` để tiếp tục hoạt động đúng nếu tỷ lệ
+hai lớp thay đổi ở lần cập nhật dữ liệu sau.
 
 ## 8. Quá trình train
 
@@ -201,7 +200,7 @@ Script chỉ ghi crop khi frame có đúng một khuôn mặt. Padding và confi
 
 ```powershell
 python -m training.train_antispoof `
-  --data data/antispoof `
+  --data data `
   --output models/antispoofing `
   --epochs 25 `
   --batch-size 32 `
@@ -388,4 +387,3 @@ Không phải kiến trúc nền MobileNetV3 hay ArcFace, mà là pipeline PAD t
 
 **Làm sao chứng minh nhiều frame tốt hơn?**  
 Cần ablation study trên cùng test set: so sánh một frame, trung bình nhiều frame và quality-weighted fusion bằng APCER/BPCER/ACER cùng latency.
-

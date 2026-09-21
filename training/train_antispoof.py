@@ -1,51 +1,81 @@
 """Fine-tune MobileNetV3-Small for RGB face presentation-attack detection.
 
-Expected data layout (split people/videos before extracting frames):
+Supported data layouts (split people/videos before training):
 
-    data/antispoof/
-      train/live/*.jpg
-      train/spoof/*.jpg
-      val/live/*.jpg
-      val/spoof/*.jpg
-      test/live/*.jpg
-      test/spoof/*.jpg
+    data/{train,validate,test}/<subject_id>/{live,spoof}/*.jpg
+
+The legacy layout ``<split>/{live,spoof}/*.jpg`` and the split name ``val``
+are also accepted. Labels are read from the live/spoof directory at any depth,
+not from the first directory below a split.
 
 The exported ONNX model always uses class order [spoof, live].
 """
 
 import argparse
 import copy
+import json
+import os
 import random
 from pathlib import Path
 
+# Keep downloaded torchvision weights inside this project. This avoids
+# permission errors on restricted Windows accounts; .torch/ is git-ignored.
+os.environ.setdefault("TORCH_HOME", str(Path(".torch").resolve()))
+
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torchvision import transforms
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 
-class RemapTarget:
-    def __init__(self, original_classes: dict[str, int]) -> None:
-        required = {"live", "spoof"}
-        if set(original_classes) != required:
-            raise ValueError(
-                f"Each split must contain exactly {sorted(required)}; "
-                f"found {sorted(original_classes)}"
-            )
-        self.mapping = {
-            original_classes["spoof"]: 0,
-            original_classes["live"]: 1,
-        }
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+CLASS_TO_INDEX = {"spoof": 0, "live": 1}
 
-    def __call__(self, target: int) -> int:
-        return self.mapping[target]
+
+class AntiSpoofDataset(Dataset):
+    """Read labels from a live/spoof path component below a split root."""
+
+    def __init__(self, root: Path, transform) -> None:
+        self.root = root
+        self.transform = transform
+        self.samples: list[tuple[Path, int]] = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            label_parts = {
+                part.lower()
+                for part in path.relative_to(root).parent.parts
+                if part.lower() in CLASS_TO_INDEX
+            }
+            if len(label_parts) != 1:
+                raise ValueError(
+                    f"Image must be inside exactly one live/spoof directory: {path}"
+                )
+            label = CLASS_TO_INDEX[label_parts.pop()]
+            self.samples.append((path, label))
+
+        if not self.samples:
+            raise ValueError(f"No supported images found in dataset split: {root}")
+        self.targets = [label for _, label in self.samples]
+        if set(self.targets) != {0, 1}:
+            raise ValueError(f"Dataset split must contain both live and spoof images: {root}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        path, label = self.samples[index]
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+        return self.transform(image), label
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, default=Path("data/antispoof"))
+    parser.add_argument("--data", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("models/antispoofing"))
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -66,13 +96,12 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def make_dataset(root: Path, transform) -> datasets.ImageFolder:
-    probe = datasets.ImageFolder(root)
-    return datasets.ImageFolder(
-        root,
-        transform=transform,
-        target_transform=RemapTarget(probe.class_to_idx),
-    )
+def resolve_split_root(data_root: Path, split: str) -> Path | None:
+    names = ("val", "validate") if split == "val" else (split,)
+    matches = [data_root / name for name in names if (data_root / name).is_dir()]
+    if len(matches) > 1:
+        raise ValueError(f"Use only one validation split directory: {matches}")
+    return matches[0] if matches else None
 
 
 def make_loaders(args: argparse.Namespace) -> dict[str, DataLoader]:
@@ -107,22 +136,23 @@ def make_loaders(args: argparse.Namespace) -> dict[str, DataLoader]:
     )
     loaders = {}
     for split in ("train", "val", "test"):
-        split_root = args.data / split
-        if not split_root.is_dir():
+        split_root = resolve_split_root(args.data, split)
+        if split_root is None:
             if split == "test":
                 continue
-            raise FileNotFoundError(f"Missing dataset split: {split_root}")
-        dataset = make_dataset(
-            split_root,
-            train_transform if split == "train" else eval_transform,
+            expected = "val or validate" if split == "val" else split
+            raise FileNotFoundError(
+                f"Missing dataset split '{expected}' below: {args.data}"
+            )
+        dataset = AntiSpoofDataset(
+            split_root, train_transform if split == "train" else eval_transform
         )
         sampler = None
         if split == "train":
-            remapped_targets = [dataset.target_transform(item) for item in dataset.targets]
-            class_counts = np.bincount(remapped_targets, minlength=2)
+            class_counts = np.bincount(dataset.targets, minlength=2)
             if np.any(class_counts == 0):
                 raise ValueError("Training split must contain both spoof and live images")
-            sample_weights = [1.0 / class_counts[target] for target in remapped_targets]
+            sample_weights = [1.0 / class_counts[target] for target in dataset.targets]
             sampler = WeightedRandomSampler(
                 sample_weights,
                 num_samples=len(sample_weights),
@@ -145,6 +175,8 @@ def make_loaders(args: argparse.Namespace) -> dict[str, DataLoader]:
 
 
 def build_model(pretrained: bool) -> nn.Module:
+    # This is where the base model is pulled into training. DEFAULT loads
+    # ImageNet weights; it never loads the previous anti-spoof checkpoint.
     weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
     model = mobilenet_v3_small(weights=weights)
     in_features = model.classifier[-1].in_features
@@ -230,6 +262,8 @@ def main() -> None:
 
     best_acer = float("inf")
     best_state = None
+    best_val_metrics = None
+    history = []
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -247,14 +281,24 @@ def main() -> None:
         scheduler.step()
 
         metrics = evaluate(model, loaders["val"], criterion, device)
+        train_loss = running_loss / max(seen, 1)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "validation": metrics,
+            }
+        )
         print(
-            f"epoch={epoch:03d} train_loss={running_loss / max(seen, 1):.4f} "
+            f"epoch={epoch:03d} train_loss={train_loss:.4f} "
             f"val_loss={metrics['loss']:.4f} acc={metrics['accuracy']:.4f} "
             f"APCER={metrics['apcer']:.4f} BPCER={metrics['bpcer']:.4f} "
             f"ACER={metrics['acer']:.4f}"
         )
         if metrics["acer"] < best_acer:
             best_acer = metrics["acer"]
+            best_val_metrics = metrics.copy()
             best_state = copy.deepcopy(model.state_dict())
             torch.save(
                 {
@@ -269,18 +313,39 @@ def main() -> None:
     if best_state is None:
         raise RuntimeError("Training did not produce a checkpoint")
     model.load_state_dict(best_state)
+    test_metrics = None
     if "test" in loaders:
-        metrics = evaluate(model, loaders["test"], criterion, device)
+        test_metrics = evaluate(model, loaders["test"], criterion, device)
         print(
             "test "
-            f"acc={metrics['accuracy']:.4f} APCER={metrics['apcer']:.4f} "
-            f"BPCER={metrics['bpcer']:.4f} ACER={metrics['acer']:.4f}"
+            f"acc={test_metrics['accuracy']:.4f} "
+            f"APCER={test_metrics['apcer']:.4f} "
+            f"BPCER={test_metrics['bpcer']:.4f} "
+            f"ACER={test_metrics['acer']:.4f}"
         )
 
     onnx_path = args.output / "mobilenetv3_pad.onnx"
     export_onnx(model, onnx_path, args.image_size)
+    metrics_path = args.output / "training_metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "data": str(args.data),
+                "device": str(device),
+                "epochs": args.epochs,
+                "image_size": args.image_size,
+                "class_names": ["spoof", "live"],
+                "best_validation": best_val_metrics,
+                "test": test_metrics,
+                "history": history,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"best_val_ACER={best_acer:.4f}")
     print(f"exported: {onnx_path}")
+    print(f"metrics: {metrics_path}")
 
 
 if __name__ == "__main__":

@@ -233,6 +233,24 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 
 ### 2. Chuẩn bị dữ liệu đúng cách
 
+Dataset hiện tại đã được chuẩn bị theo cấu trúc có thư mục người ở giữa:
+
+```text
+data/
+  train/<subject_id>/live/*.jpg
+  train/<subject_id>/spoof/*.jpg
+  validate/<subject_id>/live/*.jpg
+  validate/<subject_id>/spoof/*.jpg
+  test/<subject_id>/live/*.jpg
+  test/<subject_id>/spoof/*.jpg
+```
+
+Script train đọc trực tiếp cấu trúc này. Nhãn được lấy từ thư mục `live` hoặc
+`spoof`, không lấy từ `<subject_id>`. Tên split validation `val` và `validate`
+đều được hỗ trợ.
+
+Chỉ dùng bước dưới đây khi đầu vào vẫn còn là video/ảnh gốc chưa crop:
+
 Sắp xếp video/ảnh gốc theo cấu trúc sau. Phải chia theo **người và video nguồn** trước khi trích frame; tuyệt đối không để các frame của cùng video rơi vào nhiều split:
 
 ```text
@@ -258,11 +276,16 @@ python -m training.prepare_antispoof_data `
 
 Kết quả có cấu trúc `data/antispoof/{train,val,test}/{live,spoof}`. Script bỏ qua frame không có đúng một khuôn mặt.
 
-### 3. Train và export ONNX
+### 3. Train mới hoàn toàn và export ONNX
+
+Xóa hai file `mobilenetv3_pad.pt` và `mobilenetv3_pad.onnx` cũ trước khi chạy
+nếu muốn backend không thể vô tình dùng model cũ. Script không resume checkpoint
+anti-spoof: mỗi lần chạy đều tạo MobileNetV3-Small mới, nạp trọng số ImageNet làm
+điểm khởi đầu rồi thay classifier thành hai lớp.
 
 ```powershell
 python -m training.train_antispoof `
-  --data data/antispoof `
+  --data data `
   --output models/antispoofing `
   --epochs 25 `
   --batch-size 32 `
@@ -274,22 +297,32 @@ Script fine-tune MobileNetV3-Small, chọn checkpoint có ACER validation thấp
 ```text
 models/antispoofing/mobilenetv3_pad.pt
 models/antispoofing/mobilenetv3_pad.onnx
+models/antispoofing/training_metrics.json
 ```
 
 Thứ tự output luôn là `[spoof, live]`. File ONNX có batch động để backend suy luận nhiều frame trong một lần. Không đánh giá chất lượng đề tài chỉ bằng accuracy; ưu tiên APCER, BPCER, ACER và kiểm thử camera chưa xuất hiện trong train.
 
-#### Kết quả lần train thử hiện tại
+Đoạn nạp backbone vào quá trình train nằm trong
+`training/train_antispoof.py`, hàm `build_model`:
 
-Lần chạy ngày 19/09/2026 dùng MobileNetV3-Small pretrained, 5 epoch trên CPU và dữ liệu đã chuẩn hóa trong `data/antispoof`. Checkpoint tốt nhất được chọn theo ACER của validation:
+```python
+weights = MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
+model = mobilenet_v3_small(weights=weights)
+in_features = model.classifier[-1].in_features
+model.classifier[-1] = nn.Linear(in_features, 2)
+```
 
-| Chỉ số | Validation tốt nhất | Test |
-| --- | ---: | ---: |
-| Accuracy | 0.4806 | 0.7592 |
-| APCER | 0.6386 | 0.3491 |
-| BPCER | 0.0893 | 0.0000 |
-| ACER | 0.3639 | 0.1746 |
+`DEFAULT` là trọng số ImageNet của torchvision, không phải checkpoint
+anti-spoof cũ. Muốn train ngẫu nhiên hoàn toàn, thêm `--no-pretrained` (thường
+không nên dùng với dataset nhỏ).
 
-Đây chỉ là model smoke-test để kiểm tra toàn bộ pipeline. Khoảng cách lớn giữa validation và test cùng APCER cao cho thấy model còn yếu/overfit; chưa nên dùng các số này làm kết quả cuối của đồ án. Ngưỡng thử nghiệm đang dùng trong `.env` là `spoof=0.45`, `live=0.65`, `max_uncertainty=0.18`.
+#### Kết quả đánh giá
+
+Kết quả của model cũ không còn đại diện cho dataset hiện tại. Sau khi train xong,
+xem dòng `test acc=... APCER=... BPCER=... ACER=...` trên terminal hoặc mở
+`models/antispoofing/training_metrics.json`. File JSON lưu metric tốt nhất trên
+validation, metric test và lịch sử của từng epoch. Sau đó cần hiệu chỉnh lại các
+ngưỡng live/spoof trước khi dùng thực tế.
 
 ### 4. Cấu hình và chạy API
 
